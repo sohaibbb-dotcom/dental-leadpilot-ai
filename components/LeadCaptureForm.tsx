@@ -17,6 +17,9 @@ const initialFormValues: FormValues = {
   enquiryMessage: "",
 };
 
+// For the MVP, all public website leads go to one default clinic.
+const defaultClinicId = process.env.NEXT_PUBLIC_DEFAULT_CLINIC_ID;
+
 function classifyUrgency(enquiryMessage: string) {
   // Make the message lowercase so keyword checks are not case-sensitive.
   const message = enquiryMessage.toLowerCase();
@@ -81,19 +84,32 @@ export default function LeadCaptureForm() {
       return;
     }
 
+    if (!defaultClinicId) {
+      setErrorMessage(
+        "Default clinic is not configured yet. Add NEXT_PUBLIC_DEFAULT_CLINIC_ID to .env.local.",
+      );
+      setIsSubmitting(false);
+      return;
+    }
+
     // Classify urgency with simple keyword rules before saving the lead.
     const urgency = classifyUrgency(formValues.enquiryMessage);
 
     // Insert one new lead row into the Supabase "leads" table.
-    const { error } = await supabase.from("leads").insert({
-      patient_name: formValues.patientName,
-      phone: formValues.phone,
-      email: formValues.email,
-      enquiry: formValues.enquiryMessage,
-      clinic_name: "Demo Dental Clinic",
-      status: "new",
-      urgency: urgency,
-    });
+    const { data: savedLead, error } = await supabase
+      .from("leads")
+      .insert({
+        patient_name: formValues.patientName,
+        phone: formValues.phone,
+        email: formValues.email,
+        enquiry: formValues.enquiryMessage,
+        clinic_name: "Demo Dental Clinic",
+        clinic_id: defaultClinicId,
+        status: "new",
+        urgency: urgency,
+      })
+      .select("created_at, clinic_id")
+      .single();
 
     if (error) {
       // Log the full Supabase error in the browser console for debugging.
@@ -103,6 +119,48 @@ export default function LeadCaptureForm() {
       setErrorMessage(error.message);
       setIsSubmitting(false);
       return;
+    }
+
+    try {
+      // Ask our server API route to send the clinic an SMS alert.
+      await fetch("/api/send-lead-sms", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          patientName: formValues.patientName,
+          urgency: urgency,
+          phone: formValues.phone,
+          enquiry: formValues.enquiryMessage,
+          clinicId: savedLead?.clinic_id ?? defaultClinicId,
+        }),
+      });
+    } catch (smsError) {
+      // If SMS fails, log it for debugging but keep the lead submission successful.
+      console.error("Lead saved, but SMS notification failed:", smsError);
+    }
+
+    try {
+      // Ask our server API route to send the clinic an email alert.
+      await fetch("/api/send-lead-email", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          patientName: formValues.patientName,
+          phone: formValues.phone,
+          email: formValues.email,
+          enquiry: formValues.enquiryMessage,
+          urgency: urgency,
+          createdTime: savedLead?.created_at ?? new Date().toISOString(),
+          clinicId: savedLead?.clinic_id ?? defaultClinicId,
+        }),
+      });
+    } catch (emailError) {
+      // If email fails, log it for debugging but keep the lead submission successful.
+      console.error("Lead saved, but email notification failed:", emailError);
     }
 
     setSuccessMessage("Thank you. Your appointment request has been received.");

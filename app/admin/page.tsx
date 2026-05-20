@@ -1,12 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { isSupabaseConfigured, supabase } from "@/lib/supabase";
 
 type LeadStatus = "new" | "contacted" | "booked" | "lost";
 
 type Lead = {
   id: string;
+  clinic_id: string | null;
   patient_name: string | null;
   phone: string | null;
   email: string | null;
@@ -14,6 +16,13 @@ type Lead = {
   urgency: string | null;
   status: LeadStatus | string | null;
   created_at: string | null;
+};
+
+type ClinicUser = {
+  clinic_id: string;
+  clinics: {
+    name: string | null;
+  } | null;
 };
 
 const statusButtons: Array<{ label: string; value: LeadStatus }> = [
@@ -48,8 +57,14 @@ function getUrgencyStyle(urgency: string | null) {
 }
 
 export default function AdminPage() {
+  // Next.js router lets us redirect users between admin and login pages.
+  const router = useRouter();
+
   // Store the leads that come back from Supabase.
   const [leads, setLeads] = useState<Lead[]>([]);
+
+  // Track whether Supabase is checking if the admin user is logged in.
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
 
   // Track loading while the dashboard is fetching leads.
   const [isLoading, setIsLoading] = useState(true);
@@ -60,7 +75,14 @@ export default function AdminPage() {
   // Store a helpful message if loading or updating fails.
   const [errorMessage, setErrorMessage] = useState("");
 
-  async function loadLeads() {
+  // Store the signed-in admin email so the dashboard can show who is logged in.
+  const [adminEmail, setAdminEmail] = useState("");
+
+  // Store the clinic assigned to the signed-in admin user.
+  const [currentClinicId, setCurrentClinicId] = useState("");
+  const [currentClinicName, setCurrentClinicName] = useState("");
+
+  async function loadLeads(clinicId: string) {
     setIsLoading(true);
     setErrorMessage("");
 
@@ -72,10 +94,11 @@ export default function AdminPage() {
       return;
     }
 
-    // Fetch every column from the "leads" table, with the newest lead first.
+    // Fetch only this clinic's leads, with the newest lead first.
     const { data, error } = await supabase
       .from("leads")
       .select("*")
+      .eq("clinic_id", clinicId)
       .order("created_at", { ascending: false });
 
     // Log the raw Supabase response so we can debug what the browser receives.
@@ -98,11 +121,18 @@ export default function AdminPage() {
     setUpdatingLeadId(leadId);
     setErrorMessage("");
 
+    if (!currentClinicId) {
+      setErrorMessage("No clinic is assigned to this admin user.");
+      setUpdatingLeadId(null);
+      return;
+    }
+
     // Update only the status field for the selected lead.
     const { error } = await supabase
       .from("leads")
       .update({ status: status })
-      .eq("id", leadId);
+      .eq("id", leadId)
+      .eq("clinic_id", currentClinicId);
 
     if (error) {
       console.error("Supabase lead status update error:", error);
@@ -121,14 +151,89 @@ export default function AdminPage() {
     setUpdatingLeadId(null);
   }
 
-  useEffect(() => {
-    async function loadInitialLeads() {
-      // Load the leads once when the admin page first opens.
-      await loadLeads();
+  async function handleLogout() {
+    // Ask Supabase Auth to end the current admin session.
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      console.error("Supabase logout error:", error);
+      setErrorMessage(error.message);
+      return;
     }
 
-    loadInitialLeads();
-  }, []);
+    // Send the user back to the login page after logout.
+    router.push("/login");
+    router.refresh();
+  }
+
+  useEffect(() => {
+    async function checkAuthAndLoadLeads() {
+      if (!isSupabaseConfigured) {
+        setErrorMessage(
+          "Supabase is not configured yet. Add your Supabase URL and anon key to .env.local.",
+        );
+        setIsCheckingAuth(false);
+        setIsLoading(false);
+        return;
+      }
+
+      // Ask Supabase Auth if there is a currently signed-in admin user.
+      const {
+        data: { session },
+        error,
+      } = await supabase.auth.getSession();
+
+      if (error) {
+        console.error("Supabase auth session error:", error);
+        setErrorMessage(error.message);
+        setIsCheckingAuth(false);
+        setIsLoading(false);
+        return;
+      }
+
+      if (!session) {
+        // If no user is logged in, send them to the login page.
+        router.push("/login");
+        return;
+      }
+
+      setAdminEmail(session.user.email ?? "");
+
+      // Look up which clinic this authenticated admin user belongs to.
+      const { data: clinicUser, error: clinicUserError } = await supabase
+        .from("clinic_users")
+        .select("clinic_id, clinics(name)")
+        .eq("user_id", session.user.id)
+        .single<ClinicUser>();
+
+      if (clinicUserError) {
+        console.error("Supabase clinic user lookup error:", clinicUserError);
+        setErrorMessage(clinicUserError.message);
+        setIsCheckingAuth(false);
+        setIsLoading(false);
+        return;
+      }
+
+      setCurrentClinicId(clinicUser.clinic_id);
+      setCurrentClinicName(clinicUser.clinics?.name ?? "Assigned clinic");
+      setIsCheckingAuth(false);
+
+      // Load the leads only after the admin session and clinic are confirmed.
+      await loadLeads(clinicUser.clinic_id);
+    }
+
+    checkAuthAndLoadLeads();
+  }, [router]);
+
+  if (isCheckingAuth) {
+    return (
+      <main className="min-h-screen bg-slate-50 px-6 py-10 text-slate-950 sm:px-8 lg:px-12">
+        <div className="mx-auto max-w-7xl rounded-3xl border border-slate-200 bg-white p-8 text-slate-600">
+          Checking admin access...
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen bg-slate-50 px-6 py-10 text-slate-950 sm:px-8 lg:px-12">
@@ -142,18 +247,35 @@ export default function AdminPage() {
               Dental LeadPilot AI Leads
             </h1>
             <p className="mt-3 max-w-2xl leading-7 text-slate-600">
-              Review new patient enquiries and update their booking status.
+              Review new patient enquiries and update their booking status
+              for {currentClinicName || "your clinic"}.
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={loadLeads}
-            disabled={isLoading}
-            className="rounded-full border border-slate-300 bg-white px-5 py-3 text-sm font-bold text-slate-800 transition hover:border-teal-400 hover:bg-teal-50 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {isLoading ? "Refreshing..." : "Refresh leads"}
-          </button>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+            {adminEmail ? (
+              <p className="text-sm font-semibold text-slate-500">
+                Signed in as {adminEmail}
+              </p>
+            ) : null}
+
+            <button
+              type="button"
+              onClick={() => loadLeads(currentClinicId)}
+              disabled={isLoading || !currentClinicId}
+              className="rounded-full border border-slate-300 bg-white px-5 py-3 text-sm font-bold text-slate-800 transition hover:border-teal-400 hover:bg-teal-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isLoading ? "Refreshing..." : "Refresh leads"}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="rounded-full bg-slate-900 px-5 py-3 text-sm font-bold text-white transition hover:bg-slate-700"
+            >
+              Logout
+            </button>
+          </div>
         </div>
 
         {errorMessage ? (
